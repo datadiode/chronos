@@ -74,7 +74,9 @@ static void UsageAndExit(wchar_t *argv[]) {
         "\n"
         "Run program and report its resources usage\n"
         "   --verbose, -v          produce results in verbose format\n"
+        "   --wait, -w             wait before resuming program execution\n"
         "   --output, -o filename  write result to filename instead of stdout\n"
+        "   --inject, -i filename  sideload a dll from filename\n"
         "   program                program name to start\n"
         "   options                the program's own arguments\n" << std::endl;
     exit(1);
@@ -83,7 +85,9 @@ static void UsageAndExit(wchar_t *argv[]) {
 /* Discovered command line options */
 struct CliParams {
     bool verbose; /* true if verbose output */
+    bool wait; /* true if instructed to wait before resuming program execution */
     std::wstring outputFileName; /* file name to write results, or empty string */
+    std::wstring injectFileName; /* file name to sideload dll, or empty string */
     std::wstring cmdLine; /* The rest of command line options combined in a string */
 	std::wstring progName; /* Isolated program name to create */
 };
@@ -94,21 +98,15 @@ static bool ParseArgv(int argc, wchar_t *argv[], CliParams &result) {
     assert(argc >= 1);
     argv++;
     argc--;
-    std::vector<std::wstring> arguments(argc);
-    /* We start counting from 1 to omit program name */
-    for (int i = 0; i < argc; i++) {
-        arguments[i] = std::wstring(argv[i]);
-    }
 
     int argNo = 0;
-    bool consumeNextPositionalArgument = false;
-    std::wstring posArg(L"");
+    std::wstring *consumeNextPositionalArgument = nullptr;
 
     while (argNo < argc) {
-        std::wstring &curWord = arguments[argNo];
+        std::wstring curWord = argv[argNo];
         if (consumeNextPositionalArgument) {
-            posArg = curWord;
-            consumeNextPositionalArgument = false;
+            *consumeNextPositionalArgument = curWord;
+            consumeNextPositionalArgument = nullptr;
             argNo++;
             continue;
         }
@@ -119,23 +117,26 @@ static bool ParseArgv(int argc, wchar_t *argv[], CliParams &result) {
             break;
         }
         /* Look for matches for supported options */
-        if (curWord.find(L"-o") == 0) {
-            curWord = curWord.substr(2); /* remove the '-o' part */
+        if (int len = curWord.find(L"-o") == 0 ? 2 : curWord.find(L"--output") == 0 ? 8 : 0) {
+            curWord.erase(0, len); /* remove the '-o' part */
             if (curWord.empty()) { /* must be the next word */
-                consumeNextPositionalArgument = true;
+                consumeNextPositionalArgument = &result.outputFileName;
             } else { /* argument is attached to the flag */
-                posArg = curWord;
+                result.outputFileName = curWord;
             }
-        } else if (curWord.find(L"--output") == 0) {
-            curWord = curWord.substr(8);
-            if (curWord.empty()) {
-                consumeNextPositionalArgument = true;
+        } else if (len += curWord.find(L"-i") == 0 ? 2 : curWord.find(L"--inject") == 0 ? 8 : 0) {
+            curWord.erase(0, len); /* remove the '-i' part */
+            if (curWord.empty()) { /* must be the next word */
+                consumeNextPositionalArgument = &result.injectFileName;
             } else {
-                posArg = curWord;
+                result.injectFileName = curWord;
             }
         } else if (!curWord.compare(L"-v")
                 || !curWord.compare(L"--verbose")) {
             result.verbose = true;
+        } else if (!curWord.compare(L"-w")
+                || !curWord.compare(L"--wait")) {
+            result.wait = true;
         } else if (!curWord.compare(L"-h")
                 || !curWord.compare(L"--help")) {
             /* Help asked */
@@ -150,12 +151,9 @@ static bool ParseArgv(int argc, wchar_t *argv[], CliParams &result) {
         argNo++;
     }
 
-    if (!posArg.compare(L"--")) {
+    if (consumeNextPositionalArgument) {
         std::wcerr << "Missing positional argument" << std::endl;
         return false;
-    }
-    if (posArg.length() != 0) {
-        result.outputFileName = posArg;
     }
 
     /* Check if there is at least one positional parameter left */
@@ -163,11 +161,11 @@ static bool ParseArgv(int argc, wchar_t *argv[], CliParams &result) {
         std::wcerr << "Missing program name" << std::endl;
         return false;
     }
-    result.progName = arguments[argNo];
+    result.progName = argv[argNo];
     result.cmdLine = result.progName;
     /* Concatenate all arguments into one line */
     for (int i = argNo + 1; i < argc; i++) {
-        result.cmdLine += L" " + arguments[i];
+        result.cmdLine.append(L" ").append(argv[i]);
     }
     return true;
 }
@@ -216,6 +214,44 @@ int wmain(int argc, wchar_t* argv[]) {
     ret = AssignProcessToJobObject(hJob, hProcess);
     assert(ret);
 
+    if (!params.injectFileName.empty()) {
+        LPVOID argBuffer = VirtualAllocEx(hProcess, NULL, 4096, MEM_COMMIT, PAGE_READWRITE);
+        if (argBuffer == NULL) {
+            std::wcerr << L"Failed at VirtualAllocEx(): " 
+                << GetLastErrorDescription() << std::endl;
+            return 127;
+        }
+        BOOL success = WriteProcessMemory(hProcess, argBuffer, params.injectFileName.c_str(), (params.injectFileName.length() + 1) * sizeof(wchar_t), NULL);
+        if (!success) {
+            std::wcerr << L"Failed at WriteProcessMemory(): " 
+                << GetLastErrorDescription() << std::endl;
+            return 127;
+        }
+        HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibraryW), argBuffer, 0, NULL);
+        if (hThread == NULL) {
+            std::wcerr << L"Failed at CreateRemoteThread(): " 
+                << GetLastErrorDescription() << std::endl;
+            return 127;
+        }
+
+        WaitForSingleObject(hThread, INFINITE);
+
+        VirtualFreeEx(hProcess, argBuffer, 0, MEM_RELEASE);
+
+        DWORD exitCode = 0;
+        GetExitCodeThread(hThread, &exitCode);
+        if (exitCode == 0) {
+            std::wcerr << L"Failed to sideload " << params.injectFileName << std::endl;
+            return 127;
+        }
+    }
+
+    if (params.wait) {
+        std::wcerr << L"Hit the ENTER key to resume program execution";
+        std::wstring input;
+        std::getline(std::wcin, input);
+    }
+
     /* Now run the process and allow it to spawn children */
     ResumeThread(procInfo.hThread);
 
@@ -256,6 +292,11 @@ int wmain(int argc, wchar_t* argv[]) {
         /* We may kill survived processes, if desired */
         //std::cerr << "Killing them" << std::endl;
         //TerminateJobObject(hJob, 127);
+    }
+
+    /* If abused as a Windows substitute for the wine command, return without output */
+    if (GetModuleHandle(L"wine.exe")) {
+        return exitCode;
     }
 
     /* Get kernel and user times in hundreds of nanoseconds */
