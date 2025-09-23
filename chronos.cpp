@@ -77,6 +77,7 @@ static void UsageAndExit(wchar_t *argv[]) {
         "   --wait, -w             wait before resuming program execution\n"
         "   --output, -o filename  write result to filename instead of stdout\n"
         "   --inject, -i filename  sideload a dll from filename\n"
+        "   --memory, -m bytes     limit process memory as specified\n"
         "   program                program name to start\n"
         "   options                the program's own arguments\n" << std::endl;
     exit(1);
@@ -89,8 +90,23 @@ struct CliParams {
     std::wstring outputFileName; /* file name to write results, or empty string */
     std::wstring injectFileName; /* file name to sideload dll, or empty string */
     std::wstring cmdLine; /* The rest of command line options combined in a string */
-	std::wstring progName; /* Isolated program name to create */
+    std::wstring progName; /* Isolated program name to create */
+    std::wstring memoryLimit; /* Amount of memory which the program may consume */
 };
+
+/* Parses a byte size, optionally followed by a metric unit prefix */
+static size_t ParseSize(const wchar_t *str) {
+    wchar_t *unit = NULL;
+    size_t value = wcstoull(str, &unit, 0);
+    switch (*unit) {
+    case 'P': case 'p': value <<= 10; // fall through
+    case 'T': case 't': value <<= 10; // fall through
+    case 'G': case 'g': value <<= 10; // fall through
+    case 'M': case 'm': value <<= 10; // fall through
+    case 'K': case 'k': value <<= 10; // fall through
+    }
+    return value;
+}
 
 /* Returns true on success, false if parsing failed */
 /* BUG: may not handle quoted arguments and spaces in them as a whole */
@@ -130,6 +146,13 @@ static bool ParseArgv(int argc, wchar_t *argv[], CliParams &result) {
                 consumeNextPositionalArgument = &result.injectFileName;
             } else {
                 result.injectFileName = curWord;
+            }
+        } else if (len += curWord.find(L"-m") == 0 ? 2 : curWord.find(L"--memory") == 0 ? 8 : 0) {
+            curWord.erase(0, len); /* remove the '-i' part */
+            if (curWord.empty()) { /* must be the next word */
+                consumeNextPositionalArgument = &result.memoryLimit;
+            } else {
+                result.memoryLimit = curWord;
             }
         } else if (!curWord.compare(L"-v")
                 || !curWord.compare(L"--verbose")) {
@@ -179,6 +202,18 @@ int wmain(int argc, wchar_t* argv[]) {
         UsageAndExit(argv);
     }
 
+    /* Prepare limits */
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    limits.BasicLimitInformation.LimitFlags = 0;
+    if (SIZE_T value = ParseSize(params.memoryLimit.c_str())) {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.ProcessMemoryLimit = value;
+    } else if (!params.memoryLimit.empty()) {
+        std::wcerr << L"Invalid byte size argument: "
+            << params.memoryLimit << std::endl;
+        return 127;
+    }
+
     /* Prepare to start application */
     STARTUPINFO startUp;
     GetStartupInfo(&startUp);
@@ -213,6 +248,10 @@ int wmain(int argc, wchar_t* argv[]) {
     assert(hJob != NULL);
     ret = AssignProcessToJobObject(hJob, hProcess);
     assert(ret);
+
+    if (limits.BasicLimitInformation.LimitFlags) {
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+    }
 
     if (!params.injectFileName.empty()) {
         LPVOID argBuffer = VirtualAllocEx(hProcess, NULL, 4096, MEM_COMMIT, PAGE_READWRITE);
